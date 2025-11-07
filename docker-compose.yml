@@ -67,7 +67,59 @@ services:
       minio:
         condition: service_healthy
 
+  spark:
+    image: apache/spark:3.5.0-scala2.12-java11-python3-ubuntu
+    environment:
+      - SPARK_MODE=master
+      - SPARK_MASTER_HOST=spark
+      - SPARK_MASTER_PORT=7077
+      - SPARK_MASTER_WEBUI_PORT=8080
+    ports:
+      - "8082:8080"  # Spark Web UI
+      - "7077:7077"  # Spark Master
+      - "4040:4040"  # Spark Application UI
+    volumes:
+      - ./spark/conf:/opt/spark/conf
+      - ./spark/jars:/opt/spark/jars/extra
+      - ./setup-spark.py:/setup-spark.py
+    command: >
+      bash -c "
+        /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master &
+        sleep 10 &&
+        /opt/spark/bin/pyspark --master spark://spark:7077
+      "
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  superset:
+    image: apache/superset:latest
+    environment:
+      - SUPERSET_SECRET_KEY=your_secret_key_here
+      - SUPERSET_CONFIG_PATH=/app/superset_config.py
+    ports:
+      - "8088:8088"
+    volumes:
+      - ./superset/superset_config.py:/app/superset_config.py
+      - ./superset/init-superset.sh:/app/init-superset.sh
+      - superset_data:/app/superset_home
+    command: >
+      bash -c "
+        pip install trino[sqlalchemy] psycopg2-binary &&
+        chmod +x /app/init-superset.sh &&
+        /app/init-superset.sh &&
+        superset run -h 0.0.0.0 -p 8088 --with-threads --reload --debugger
+      "
+    depends_on:
+      postgres:
+        condition: service_healthy
+      trino:
+        condition: service_started
+
 volumes:
   postgres_data:
   minio_data:
   minio_hr_data:
+  superset_data:

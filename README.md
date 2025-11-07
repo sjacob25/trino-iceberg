@@ -1,6 +1,6 @@
 # Trino Iceberg Sales Analytics
 
-Docker setup for running Trino queries on Iceberg tables with PostgreSQL catalog and MinIO storage, featuring sample sales data.
+Docker setup for running Trino queries on Iceberg tables with PostgreSQL catalog and MinIO storage, featuring sample sales data, Spark integration, and Superset dashboards.
 
 ## Quick Start
 
@@ -64,6 +64,8 @@ JOIN postgresql.analytics.customers c ON t.customer_id = c.customer_id;
 ## Services
 
 - **Trino**: http://localhost:8081
+- **Spark UI**: http://localhost:8082
+- **Superset**: http://localhost:8088 (admin/admin)
 - **Sales MinIO Console**: http://localhost:9001 (minioadmin/minioadmin)
 - **HR MinIO Console**: http://localhost:9004 (hradmin/hradmin123)
 - **PostgreSQL**: localhost:5434 (iceberg/password)
@@ -81,6 +83,16 @@ JOIN postgresql.analytics.customers c ON t.customer_id = c.customer_id;
 - `iceberg_hr` - HR data in isolated MinIO
 - `postgresql` - Direct PostgreSQL access
 - `memory` - In-memory tables
+
+## Superset Database Connections
+
+Add these connections in Superset UI:
+
+1. **Trino Iceberg**: `trino://trino:8080/iceberg`
+2. **Trino HR**: `trino://trino:8080/iceberg_hr`
+3. **Trino PostgreSQL**: `trino://trino:8080/postgresql`
+4. **Direct PostgreSQL**: `postgresql://iceberg:password@postgres:5432/iceberg`
+5. **Trino Memory**: `trino://trino:8080/memory`
 
 ## Cleanup
 
