@@ -9,7 +9,30 @@ Run the automated setup script:
 ./setup.sh
 ```
 
-Or manually:
+## Build from GitHub Sources
+
+To build Trino and Iceberg from GitHub sources:
+
+```bash
+# Build from source (takes 15-30 minutes)
+./build-from-source.sh
+
+# Or use development build (faster)
+docker build -t trino-custom sources/trino/ -f sources/trino/Dockerfile.dev
+```
+
+## Source Structure
+
+```
+sources/
+├── trino/
+│   ├── Dockerfile          # Full build from GitHub
+│   └── Dockerfile.dev      # Development build
+└── iceberg/
+    └── Dockerfile          # Iceberg from GitHub
+```
+
+## Manual Setup
 
 1. Start services: `docker-compose up -d`
 2. Wait 30 seconds, then: `docker exec trino-iceberg-minio-1 mc mb /data/warehouse`
@@ -32,25 +55,32 @@ SELECT product_category, SUM(amount) as total_sales
 FROM iceberg.sales.transactions 
 GROUP BY product_category;
 
--- Top customers
-SELECT c.customer_name, SUM(t.amount) as total_spent
+-- Cross-catalog join
+SELECT t.product_name, c.customer_name, t.amount
 FROM iceberg.sales.transactions t
-JOIN iceberg.sales.customers c ON t.customer_id = c.customer_id
-GROUP BY c.customer_name
-ORDER BY total_spent DESC;
+JOIN postgresql.analytics.customers c ON t.customer_id = c.customer_id;
 ```
 
 ## Services
 
-- **Trino**: http://localhost:8080
-- **MinIO Console**: http://localhost:9001 (minioadmin/minioadmin)
-- **PostgreSQL**: localhost:5432 (iceberg/password)
+- **Trino**: http://localhost:8081
+- **Sales MinIO Console**: http://localhost:9001 (minioadmin/minioadmin)
+- **HR MinIO Console**: http://localhost:9004 (hradmin/hradmin123)
+- **PostgreSQL**: localhost:5434 (iceberg/password)
 
 ## Data Structure
 
-- **Sales Transactions**: Product sales with customer, pricing, and location data
-- **Customers**: Customer profiles with contact information
-- **Storage**: All data stored in MinIO S3-compatible storage via Iceberg format
+- **Sales Transactions**: Product sales with customer, pricing, and location data (Main MinIO)
+- **HR Employees**: Employee information (Isolated HR MinIO)
+- **Customers**: Customer profiles in PostgreSQL
+- **Storage**: Data stored across multiple MinIO instances via Iceberg format
+
+## Catalogs
+
+- `iceberg` - Sales data in main MinIO
+- `iceberg_hr` - HR data in isolated MinIO
+- `postgresql` - Direct PostgreSQL access
+- `memory` - In-memory tables
 
 ## Cleanup
 

@@ -52,7 +52,9 @@ services:
       retries: 5
 
   trino:
-    build: .
+    build: 
+      context: sources/trino
+      dockerfile: Dockerfile
     ports:
       - "8081:8080"
     volumes:
