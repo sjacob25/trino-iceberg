@@ -34,6 +34,23 @@ services:
       timeout: 5s
       retries: 5
 
+  minio-hr:
+    image: minio/minio:latest
+    environment:
+      MINIO_ROOT_USER: hradmin
+      MINIO_ROOT_PASSWORD: hradmin123
+    ports:
+      - "9003:9000"
+      - "9004:9001"
+    volumes:
+      - minio_hr_data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   trino:
     build: .
     ports:
@@ -51,3 +68,4 @@ services:
 volumes:
   postgres_data:
   minio_data:
+  minio_hr_data:
