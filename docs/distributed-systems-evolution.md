@@ -501,94 +501,835 @@ Characteristics:
 ### Horizontal Scaling Patterns
 
 #### 1. Stateless Services
+
+**What is a Stateless Service?**
+
+A stateless service is one that doesn't maintain any server-side state between requests. Each request contains all the information needed to process it, and the service doesn't remember anything about previous requests.
+
+**Key Characteristics:**
+- **No Memory Between Requests**: Each request is independent
+- **Identical Instances**: All service instances are functionally identical
+- **Perfect Scalability**: Can add/remove instances without data loss
+- **Load Balancer Friendly**: Any instance can handle any request
+
+**Challenges of Stateless Design:**
+
+1. **Session Management**
 ```java
-// Stateless service - can run on any node
+// Challenge: Where to store user session data?
+// Bad: Store in server memory (creates state)
 @RestController
-public class StatelessCalculatorService {
+public class StatefulUserService {
     
-    @PostMapping("/calculate")
-    public CalculationResult calculate(@RequestBody CalculationRequest request) {
-        // No server-side state - purely functional
-        double result = performCalculation(request.getOperands(), request.getOperation());
-        
-        return new CalculationResult(result, System.currentTimeMillis());
+    private Map<String, UserSession> sessions = new HashMap<>(); // BAD: Server state
+    
+    @PostMapping("/login")
+    public LoginResponse login(@RequestBody LoginRequest request) {
+        UserSession session = authenticateUser(request);
+        sessions.put(session.getSessionId(), session); // Creates server state
+        return new LoginResponse(session.getSessionId());
     }
     
-    private double performCalculation(List<Double> operands, String operation) {
-        switch (operation) {
-            case "SUM": return operands.stream().mapToDouble(Double::doubleValue).sum();
-            case "AVG": return operands.stream().mapToDouble(Double::doubleValue).average().orElse(0);
-            case "MAX": return operands.stream().mapToDouble(Double::doubleValue).max().orElse(0);
-            default: throw new UnsupportedOperationException("Unknown operation: " + operation);
+    @GetMapping("/profile")
+    public UserProfile getProfile(@RequestHeader("Session-Id") String sessionId) {
+        UserSession session = sessions.get(sessionId); // Depends on server state
+        if (session == null) {
+            throw new UnauthorizedException("Invalid session");
+        }
+        return getUserProfile(session.getUserId());
+    }
+}
+
+// Solution: External session storage
+@RestController
+public class StatelessUserService {
+    
+    @Autowired
+    private RedisTemplate<String, UserSession> sessionStore; // External state
+    
+    @PostMapping("/login")
+    public LoginResponse login(@RequestBody LoginRequest request) {
+        UserSession session = authenticateUser(request);
+        
+        // Store session externally
+        sessionStore.opsForValue().set(session.getSessionId(), session, Duration.ofHours(24));
+        
+        return new LoginResponse(session.getSessionId());
+    }
+    
+    @GetMapping("/profile")
+    public UserProfile getProfile(@RequestHeader("Session-Id") String sessionId) {
+        // Retrieve session from external store
+        UserSession session = sessionStore.opsForValue().get(sessionId);
+        if (session == null) {
+            throw new UnauthorizedException("Invalid session");
+        }
+        return getUserProfile(session.getUserId());
+    }
+}
+```
+
+2. **Data Consistency Across Requests**
+```java
+// Challenge: Maintaining consistency without server state
+@RestController
+public class StatelessOrderService {
+    
+    @Autowired
+    private DatabaseService database;
+    
+    @Autowired
+    private DistributedLockService lockService;
+    
+    @PostMapping("/orders")
+    public OrderResponse createOrder(@RequestBody OrderRequest request) {
+        // Challenge: Ensure inventory consistency across multiple instances
+        
+        String lockKey = "inventory:" + request.getProductId();
+        DistributedLock lock = lockService.acquireLock(lockKey, Duration.ofSeconds(30));
+        
+        try {
+            // Check inventory atomically
+            Product product = database.getProduct(request.getProductId());
+            if (product.getStock() < request.getQuantity()) {
+                throw new InsufficientStockException();
+            }
+            
+            // Create order and update inventory in transaction
+            Order order = new Order(request.getCustomerId(), request.getProductId(), request.getQuantity());
+            database.executeTransaction(() -> {
+                database.saveOrder(order);
+                database.updateProductStock(request.getProductId(), -request.getQuantity());
+            });
+            
+            return new OrderResponse(order.getId(), "SUCCESS");
+            
+        } finally {
+            lock.release();
+        }
+    }
+}
+```
+
+3. **Caching Without Local State**
+```java
+// Challenge: Implement caching in stateless services
+@Service
+public class StatelessProductService {
+    
+    @Autowired
+    private ProductRepository productRepository;
+    
+    @Autowired
+    private DistributedCache distributedCache; // External cache (Redis, Hazelcast)
+    
+    public Product getProduct(String productId) {
+        // Check distributed cache first
+        String cacheKey = "product:" + productId;
+        Product cachedProduct = distributedCache.get(cacheKey, Product.class);
+        
+        if (cachedProduct != null) {
+            return cachedProduct;
+        }
+        
+        // Load from database
+        Product product = productRepository.findById(productId);
+        
+        // Cache for future requests (any instance can use it)
+        distributedCache.put(cacheKey, product, Duration.ofMinutes(30));
+        
+        return product;
+    }
+    
+    public void updateProduct(Product product) {
+        // Update database
+        productRepository.save(product);
+        
+        // Invalidate cache to maintain consistency
+        String cacheKey = "product:" + product.getId();
+        distributedCache.evict(cacheKey);
+        
+        // Optionally, update cache with new value
+        distributedCache.put(cacheKey, product, Duration.ofMinutes(30));
+    }
+}
+```
+
+**How Stateless Services are Achieved:**
+
+1. **Externalize All State**
+```java
+// Configuration for external state storage
+@Configuration
+public class StatelessConfiguration {
+    
+    // Session storage in Redis
+    @Bean
+    public RedisConnectionFactory redisConnectionFactory() {
+        LettuceConnectionFactory factory = new LettuceConnectionFactory(
+            new RedisStandaloneConfiguration("redis-cluster.example.com", 6379));
+        return factory;
+    }
+    
+    @Bean
+    public RedisTemplate<String, Object> redisTemplate() {
+        RedisTemplate<String, Object> template = new RedisTemplate<>();
+        template.setConnectionFactory(redisConnectionFactory());
+        template.setDefaultSerializer(new GenericJackson2JsonRedisSerializer());
+        return template;
+    }
+    
+    // Database connection pooling
+    @Bean
+    public DataSource dataSource() {
+        HikariConfig config = new HikariConfig();
+        config.setJdbcUrl("jdbc:postgresql://db-cluster.example.com:5432/app_db");
+        config.setUsername("app_user");
+        config.setPassword("app_password");
+        config.setMaximumPoolSize(20); // Pool shared across instances
+        return new HikariDataSource(config);
+    }
+    
+    // Distributed locking
+    @Bean
+    public DistributedLockService distributedLockService() {
+        return new RedisDistributedLockService(redisConnectionFactory());
+    }
+}
+```
+
+2. **Stateless Authentication with JWT**
+```java
+// JWT-based stateless authentication
+@Component
+public class JWTAuthenticationService {
+    
+    @Value("${jwt.secret}")
+    private String jwtSecret;
+    
+    @Value("${jwt.expiration}")
+    private long jwtExpiration;
+    
+    public String generateToken(User user) {
+        Date expiryDate = new Date(System.currentTimeMillis() + jwtExpiration);
+        
+        return Jwts.builder()
+            .setSubject(user.getId())
+            .claim("username", user.getUsername())
+            .claim("roles", user.getRoles())
+            .setIssuedAt(new Date())
+            .setExpiration(expiryDate)
+            .signWith(SignatureAlgorithm.HS512, jwtSecret)
+            .compact();
+    }
+    
+    public UserDetails validateToken(String token) {
+        try {
+            Claims claims = Jwts.parser()
+                .setSigningKey(jwtSecret)
+                .parseClaimsJws(token)
+                .getBody();
+            
+            // All user info is in the token - no server lookup needed
+            return UserDetails.builder()
+                .userId(claims.getSubject())
+                .username(claims.get("username", String.class))
+                .roles(claims.get("roles", List.class))
+                .build();
+                
+        } catch (JwtException e) {
+            throw new InvalidTokenException("Invalid JWT token", e);
         }
     }
 }
 
-// Load balancer can route to any instance
+// Stateless authentication filter
+@Component
+public class JWTAuthenticationFilter extends OncePerRequestFilter {
+    
+    @Autowired
+    private JWTAuthenticationService jwtService;
+    
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, 
+                                  HttpServletResponse response, 
+                                  FilterChain filterChain) throws ServletException, IOException {
+        
+        String token = extractTokenFromRequest(request);
+        
+        if (token != null) {
+            try {
+                UserDetails userDetails = jwtService.validateToken(token);
+                
+                // Set authentication context (no database lookup needed)
+                Authentication auth = new JWTAuthentication(userDetails);
+                SecurityContextHolder.getContext().setAuthentication(auth);
+                
+            } catch (InvalidTokenException e) {
+                response.setStatus(HttpStatus.UNAUTHORIZED.value());
+                return;
+            }
+        }
+        
+        filterChain.doFilter(request, response);
+    }
+}
+```
+
+3. **Idempotent Operations**
+```java
+// Ensure operations can be safely retried
+@RestController
+public class IdempotentPaymentService {
+    
+    @Autowired
+    private PaymentRepository paymentRepository;
+    
+    @PostMapping("/payments")
+    public PaymentResponse processPayment(@RequestBody PaymentRequest request) {
+        // Use idempotency key to prevent duplicate processing
+        String idempotencyKey = request.getIdempotencyKey();
+        
+        // Check if payment already processed
+        Payment existingPayment = paymentRepository.findByIdempotencyKey(idempotencyKey);
+        if (existingPayment != null) {
+            // Return existing result - safe to retry
+            return new PaymentResponse(existingPayment.getId(), existingPayment.getStatus());
+        }
+        
+        // Process payment atomically
+        Payment payment = new Payment(
+            idempotencyKey,
+            request.getAmount(),
+            request.getCustomerId(),
+            PaymentStatus.PROCESSING
+        );
+        
+        try {
+            // External payment processing
+            PaymentGatewayResponse gatewayResponse = paymentGateway.charge(
+                request.getAmount(), request.getPaymentMethod());
+            
+            payment.setStatus(gatewayResponse.isSuccessful() ? 
+                PaymentStatus.COMPLETED : PaymentStatus.FAILED);
+            payment.setGatewayTransactionId(gatewayResponse.getTransactionId());
+            
+        } catch (Exception e) {
+            payment.setStatus(PaymentStatus.FAILED);
+            payment.setErrorMessage(e.getMessage());
+        }
+        
+        // Save final state
+        paymentRepository.save(payment);
+        
+        return new PaymentResponse(payment.getId(), payment.getStatus());
+    }
+}
+```
+
+**Benefits of Stateless Services:**
+
+1. **Perfect Horizontal Scalability**
+```java
+// Load balancer configuration for stateless services
 @Configuration
 public class LoadBalancerConfiguration {
     
     @Bean
-    public LoadBalancer roundRobinLoadBalancer() {
+    public LoadBalancer createLoadBalancer() {
         return LoadBalancer.builder()
-            .algorithm(LoadBalancingAlgorithm.ROUND_ROBIN)
+            .algorithm(LoadBalancingAlgorithm.ROUND_ROBIN) // Any algorithm works
             .healthCheck(true)
+            .instances(Arrays.asList(
+                "http://service-instance-1:8080",
+                "http://service-instance-2:8080",
+                "http://service-instance-3:8080"
+                // Can add/remove instances dynamically
+            ))
             .build();
+    }
+}
+
+// Auto-scaling configuration
+@Component
+public class AutoScalingController {
+    
+    @Scheduled(fixedRate = 30000)
+    public void autoScale() {
+        double cpuUsage = metricsService.getAverageCpuUsage();
+        int currentInstances = serviceRegistry.getInstanceCount();
+        
+        if (cpuUsage > 80 && currentInstances < 20) {
+            // Scale up - safe because services are stateless
+            containerOrchestrator.scaleUp("payment-service", currentInstances + 2);
+        } else if (cpuUsage < 20 && currentInstances > 2) {
+            // Scale down - safe because no state is lost
+            containerOrchestrator.scaleDown("payment-service", currentInstances - 1);
+        }
     }
 }
 ```
 
-#### 2. Data Partitioning (Sharding)
+2. **Fault Tolerance**
 ```java
-// Horizontal partitioning of data across nodes
-public class ShardedUserService {
+// Circuit breaker for stateless service calls
+@Component
+public class ResilientServiceClient {
+    
+    private final CircuitBreaker circuitBreaker = CircuitBreaker.ofDefaults("user-service");
+    
+    public User getUserById(String userId) {
+        return circuitBreaker.executeSupplier(() -> {
+            // If one instance fails, try another - they're all identical
+            return userServiceClient.getUser(userId);
+        }).recover(throwable -> {
+            // Fallback doesn't need to worry about state consistency
+            return getCachedUser(userId);
+        });
+    }
+}
+```
+
+**Real-World Example: Netflix's Stateless Architecture**
+```java
+// Netflix-style stateless microservice
+@RestController
+public class MovieRecommendationService {
+    
+    @Autowired
+    private RecommendationEngine recommendationEngine;
+    
+    @Autowired
+    private UserPreferencesService userPreferencesService;
+    
+    @GetMapping("/recommendations/{userId}")
+    public RecommendationResponse getRecommendations(@PathVariable String userId,
+                                                   @RequestParam(defaultValue = "10") int limit) {
+        
+        // All data fetched fresh for each request - no server state
+        UserPreferences preferences = userPreferencesService.getUserPreferences(userId);
+        ViewingHistory history = userPreferencesService.getViewingHistory(userId);
+        
+        // Stateless computation
+        List<Movie> recommendations = recommendationEngine.generateRecommendations(
+            preferences, history, limit);
+        
+        return new RecommendationResponse(userId, recommendations, System.currentTimeMillis());
+    }
+}
+```
+
+This stateless design allows Netflix to:
+- Run thousands of identical service instances
+- Scale up/down based on demand without data loss
+- Deploy new versions with zero downtime (blue-green deployments)
+- Achieve 99.99% availability through redundancy
+
+#### 2. Data Partitioning (Sharding)
+
+**What is Data Partitioning?**
+
+Data partitioning (sharding) is the practice of splitting a large dataset across multiple database instances (shards) to distribute load and enable horizontal scaling. Each shard contains a subset of the total data.
+
+**Key Concepts:**
+- **Shard**: Individual database instance containing part of the data
+- **Shard Key**: The field used to determine which shard stores each record
+- **Routing**: Logic that determines which shard to query for a given request
+- **Rebalancing**: Moving data between shards as the system grows
+
+**Types of Partitioning:**
+
+1. **Horizontal Partitioning (Sharding)**
+```java
+// Range-based sharding
+public class RangeBasedSharding {
+    
+    private final Map<String, DatabaseShard> shardMap;
+    
+    public RangeBasedSharding() {
+        shardMap = Map.of(
+            "shard1", new DatabaseShard("shard1", "A", "F"),  // A-F
+            "shard2", new DatabaseShard("shard2", "G", "M"),  // G-M
+            "shard3", new DatabaseShard("shard3", "N", "S"),  // N-S
+            "shard4", new DatabaseShard("shard4", "T", "Z")   // T-Z
+        );
+    }
+    
+    public DatabaseShard getShardForUser(String username) {
+        char firstChar = username.toUpperCase().charAt(0);
+        
+        for (DatabaseShard shard : shardMap.values()) {
+            if (firstChar >= shard.getStartRange().charAt(0) && 
+                firstChar <= shard.getEndRange().charAt(0)) {
+                return shard;
+            }
+        }
+        
+        throw new IllegalArgumentException("No shard found for username: " + username);
+    }
+    
+    // Challenge: Uneven distribution
+    public void demonstrateUnevenDistribution() {
+        // Problem: Names starting with 'S' are much more common than 'X'
+        // Shard3 (N-S) will be overloaded while others are underutilized
+        
+        Map<String, Integer> distribution = Map.of(
+            "shard1", 15,  // A-F: 15% of users
+            "shard2", 20,  // G-M: 20% of users  
+            "shard3", 45,  // N-S: 45% of users (overloaded!)
+            "shard4", 20   // T-Z: 20% of users
+        );
+    }
+}
+
+// Hash-based sharding for better distribution
+public class HashBasedSharding {
     
     private final List<DatabaseShard> shards;
     private final ConsistentHashRing hashRing;
     
-    public ShardedUserService(List<DatabaseShard> shards) {
+    public HashBasedSharding(List<DatabaseShard> shards) {
         this.shards = shards;
         this.hashRing = new ConsistentHashRing(shards);
     }
     
-    public User getUserById(String userId) {
-        // Determine which shard contains the user
-        DatabaseShard shard = hashRing.getShard(userId);
-        return shard.getUserById(userId);
+    public DatabaseShard getShardForUser(String userId) {
+        // Hash provides even distribution
+        return hashRing.getShard(userId);
     }
     
-    public void createUser(User user) {
-        // Route to appropriate shard based on user ID
-        DatabaseShard shard = hashRing.getShard(user.getId());
-        shard.createUser(user);
+    // Consistent hashing handles shard addition/removal gracefully
+    public void addShard(DatabaseShard newShard) {
+        hashRing.addNode(newShard);
+        // Only ~1/N of data needs to be moved (N = number of shards)
     }
     
-    // Consistent hashing for even distribution
-    private static class ConsistentHashRing {
-        private final TreeMap<Integer, DatabaseShard> ring = new TreeMap<>();
+    public void removeShard(DatabaseShard shard) {
+        hashRing.removeNode(shard);
+        // Data is redistributed to remaining shards
+    }
+}
+```
+
+2. **Vertical Partitioning**
+```java
+// Split table by columns based on access patterns
+public class VerticalPartitioning {
+    
+    // Frequently accessed user data
+    @Entity
+    @Table(name = "user_core")
+    public class UserCore {
+        private String userId;
+        private String username;
+        private String email;
+        private Date lastLogin;
+        // Hot data - accessed frequently
+    }
+    
+    // Infrequently accessed user data
+    @Entity
+    @Table(name = "user_profile")
+    public class UserProfile {
+        private String userId;
+        private String fullName;
+        private String address;
+        private String phoneNumber;
+        private Date birthDate;
+        private String biography;
+        // Cold data - accessed rarely
+    }
+    
+    @Service
+    public class UserService {
         
-        public ConsistentHashRing(List<DatabaseShard> shards) {
-            for (DatabaseShard shard : shards) {
-                // Add multiple virtual nodes for better distribution
-                for (int i = 0; i < 100; i++) {
-                    int hash = hash(shard.getId() + ":" + i);
-                    ring.put(hash, shard);
-                }
-            }
+        @Autowired
+        private UserCoreRepository coreRepository;
+        
+        @Autowired
+        private UserProfileRepository profileRepository;
+        
+        public UserCore getBasicUserInfo(String userId) {
+            // Fast query - only accesses hot data
+            return coreRepository.findById(userId);
         }
         
-        public DatabaseShard getShard(String key) {
-            int hash = hash(key);
-            Map.Entry<Integer, DatabaseShard> entry = ring.ceilingEntry(hash);
-            return entry != null ? entry.getValue() : ring.firstEntry().getValue();
-        }
-        
-        private int hash(String key) {
-            return key.hashCode();
+        public CompleteUser getCompleteUserInfo(String userId) {
+            // Joins when complete data needed
+            UserCore core = coreRepository.findById(userId);
+            UserProfile profile = profileRepository.findById(userId);
+            
+            return new CompleteUser(core, profile);
         }
     }
 }
 ```
+
+**Challenges of Data Partitioning:**
+
+1. **Cross-Shard Queries**
+```java
+// Challenge: Queries spanning multiple shards
+@Service
+public class CrossShardQueryService {
+    
+    private final List<DatabaseShard> allShards;
+    private final ShardingStrategy shardingStrategy;
+    
+    // Expensive: Query all shards and aggregate results
+    public List<Order> getOrdersByDateRange(Date startDate, Date endDate) {
+        List<CompletableFuture<List<Order>>> futures = new ArrayList<>();
+        
+        // Must query all shards since orders could be anywhere
+        for (DatabaseShard shard : allShards) {
+            CompletableFuture<List<Order>> future = CompletableFuture.supplyAsync(() -> {
+                return shard.getOrdersByDateRange(startDate, endDate);
+            });
+            futures.add(future);
+        }
+        
+        // Collect and merge results
+        List<Order> allOrders = futures.stream()
+            .map(CompletableFuture::join)
+            .flatMap(List::stream)
+            .collect(Collectors.toList());
+        
+        // Sort merged results
+        return allOrders.stream()
+            .sorted(Comparator.comparing(Order::getOrderDate))
+            .collect(Collectors.toList());
+    }
+    
+    // Better: Use secondary index or denormalization
+    public List<Order> getOrdersByDateRangeOptimized(Date startDate, Date endDate) {
+        // Option 1: Separate time-series database for date-based queries
+        return timeSeriesDB.getOrdersByDateRange(startDate, endDate);
+        
+        // Option 2: Denormalized view partitioned by date
+        // return datePartitionedOrderView.getOrdersByDateRange(startDate, endDate);
+    }
+}
+```
+
+2. **Distributed Transactions**
+```java
+// Challenge: Maintaining ACID across shards
+@Service
+public class DistributedTransactionService {
+    
+    @Autowired
+    private TransactionManager transactionManager;
+    
+    // Two-Phase Commit (2PC) for cross-shard transactions
+    public void transferMoney(String fromUserId, String toUserId, BigDecimal amount) {
+        DatabaseShard fromShard = shardingStrategy.getShardForUser(fromUserId);
+        DatabaseShard toShard = shardingStrategy.getShardForUser(toUserId);
+        
+        if (fromShard.equals(toShard)) {
+            // Same shard - use local transaction
+            fromShard.executeTransaction(() -> {
+                fromShard.debitAccount(fromUserId, amount);
+                fromShard.creditAccount(toUserId, amount);
+            });
+        } else {
+            // Cross-shard - use distributed transaction
+            DistributedTransaction dtx = transactionManager.begin();
+            
+            try {
+                // Phase 1: Prepare
+                boolean fromPrepared = fromShard.prepare(dtx.getId(), 
+                    () -> fromShard.debitAccount(fromUserId, amount));
+                boolean toPrepared = toShard.prepare(dtx.getId(),
+                    () -> toShard.creditAccount(toUserId, amount));
+                
+                if (fromPrepared && toPrepared) {
+                    // Phase 2: Commit
+                    fromShard.commit(dtx.getId());
+                    toShard.commit(dtx.getId());
+                } else {
+                    // Abort transaction
+                    fromShard.abort(dtx.getId());
+                    toShard.abort(dtx.getId());
+                    throw new TransactionAbortedException("Failed to prepare transaction");
+                }
+                
+            } catch (Exception e) {
+                // Rollback on any failure
+                fromShard.abort(dtx.getId());
+                toShard.abort(dtx.getId());
+                throw e;
+            }
+        }
+    }
+    
+    // Alternative: Saga pattern for eventual consistency
+    public void transferMoneySaga(String fromUserId, String toUserId, BigDecimal amount) {
+        SagaTransaction saga = sagaManager.begin();
+        
+        try {
+            // Step 1: Debit from source account
+            saga.addStep(
+                () -> fromShard.debitAccount(fromUserId, amount),
+                () -> fromShard.creditAccount(fromUserId, amount) // Compensating action
+            );
+            
+            // Step 2: Credit to destination account
+            saga.addStep(
+                () -> toShard.creditAccount(toUserId, amount),
+                () -> toShard.debitAccount(toUserId, amount) // Compensating action
+            );
+            
+            saga.execute();
+            
+        } catch (Exception e) {
+            saga.compensate(); // Run compensating actions in reverse order
+            throw e;
+        }
+    }
+}
+```
+
+3. **Shard Rebalancing**
+```java
+// Challenge: Adding/removing shards and rebalancing data
+@Service
+public class ShardRebalancingService {
+    
+    @Autowired
+    private DataMigrationService migrationService;
+    
+    public void addNewShard(DatabaseShard newShard) {
+        // 1. Add shard to consistent hash ring
+        hashRing.addNode(newShard);
+        
+        // 2. Identify data that needs to be moved
+        List<DataMigrationTask> migrationTasks = new ArrayList<>();
+        
+        for (DatabaseShard existingShard : existingShards) {
+            // Find keys that now belong to new shard
+            List<String> keysToMigrate = existingShard.getAllKeys().stream()
+                .filter(key -> hashRing.getShard(key).equals(newShard))
+                .collect(Collectors.toList());
+            
+            if (!keysToMigrate.isEmpty()) {
+                migrationTasks.add(new DataMigrationTask(existingShard, newShard, keysToMigrate));
+            }
+        }
+        
+        // 3. Migrate data in background
+        CompletableFuture.runAsync(() -> {
+            for (DataMigrationTask task : migrationTasks) {
+                migrateDataSafely(task);
+            }
+        });
+    }
+    
+    private void migrateDataSafely(DataMigrationTask task) {
+        for (String key : task.getKeysToMigrate()) {
+            try {
+                // 1. Copy data to new shard
+                Object data = task.getSourceShard().getData(key);
+                task.getTargetShard().putData(key, data);
+                
+                // 2. Verify data integrity
+                Object copiedData = task.getTargetShard().getData(key);
+                if (!data.equals(copiedData)) {
+                    throw new DataMigrationException("Data integrity check failed for key: " + key);
+                }
+                
+                // 3. Update routing to point to new shard
+                routingTable.updateRoute(key, task.getTargetShard());
+                
+                // 4. Delete from old shard (after grace period)
+                scheduleDelayedDeletion(task.getSourceShard(), key, Duration.ofHours(24));
+                
+            } catch (Exception e) {
+                log.error("Failed to migrate key: " + key, e);
+                // Implement retry logic or manual intervention
+            }
+        }
+    }
+}
+```
+
+**Best Practices for Data Partitioning:**
+
+1. **Choose the Right Shard Key**
+```java
+// Good shard key characteristics
+public class ShardKeySelection {
+    
+    // Good: High cardinality, even distribution
+    public DatabaseShard getShardByUserId(String userId) {
+        // UUIDs provide excellent distribution
+        return hashRing.getShard(userId);
+    }
+    
+    // Good: Composite key for better distribution
+    public DatabaseShard getShardByCompositeKey(String customerId, String region) {
+        String compositeKey = customerId + ":" + region;
+        return hashRing.getShard(compositeKey);
+    }
+    
+    // Bad: Low cardinality leads to hotspots
+    public DatabaseShard getShardByCountry(String country) {
+        // Problem: Most users might be from one country
+        return hashRing.getShard(country); // Avoid this!
+    }
+    
+    // Bad: Sequential keys create hotspots
+    public DatabaseShard getShardByTimestamp(long timestamp) {
+        // Problem: All new data goes to same shard
+        return hashRing.getShard(String.valueOf(timestamp)); // Avoid this!
+    }
+}
+```
+
+2. **Design for Query Patterns**
+```java
+// Optimize sharding for common query patterns
+@Service
+public class QueryOptimizedSharding {
+    
+    // Shard by tenant for multi-tenant applications
+    public DatabaseShard getShardByTenant(String tenantId) {
+        // Benefit: Tenant queries stay within single shard
+        return hashRing.getShard(tenantId);
+    }
+    
+    // Denormalize for cross-shard queries
+    @Entity
+    public class OrderSummary {
+        private String orderId;
+        private String customerId;
+        private Date orderDate;
+        private BigDecimal totalAmount;
+        private String status;
+        
+        // Denormalized customer info for reporting
+        private String customerName;
+        private String customerRegion;
+        private String customerSegment;
+    }
+    
+    // Create read replicas for analytics
+    public void setupAnalyticsReplicas() {
+        // Aggregate data from all shards into analytics database
+        ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+        
+        scheduler.scheduleAtFixedRate(() -> {
+            // ETL process to sync data for analytics
+            List<OrderSummary> allOrders = new ArrayList<>();
+            
+            for (DatabaseShard shard : allShards) {
+                allOrders.addAll(shard.getRecentOrders());
+            }
+            
+            analyticsDatabase.bulkInsert(allOrders);
+            
+        }, 0, 1, TimeUnit.HOURS);
+    }
+}
 
 #### 3. Replication Strategies
 ```java
@@ -2789,3 +3530,701 @@ The evolution from centralized mainframes to distributed cloud-native systems ha
 - **Accelerated Innovation**: Faster development and deployment cycles
 
 The future of distributed systems lies in intelligent, autonomous networks that can adapt, optimize, and heal themselves while providing unprecedented scale, performance, and reliability. As we move toward quantum computing, AI integration, and ultra-low latency networks, distributed systems will continue to be the foundation of our digital infrastructure.
+#### 3. Replication Strategies
+
+**What is Replication?**
+
+Replication is the practice of maintaining multiple copies of data across different nodes to provide fault tolerance, improve read performance, and ensure high availability. Unlike partitioning which splits data, replication duplicates data.
+
+**Key Concepts:**
+- **Replica**: A copy of data stored on a different node
+- **Replication Factor**: Number of copies maintained (e.g., 3 replicas = 1 primary + 2 copies)
+- **Consistency Level**: How synchronized replicas must be
+- **Conflict Resolution**: How to handle concurrent updates to replicas
+
+**Types of Replication:**
+
+1. **Master-Slave Replication (Primary-Secondary)**
+```java
+// Master-slave replication implementation
+public class MasterSlaveReplication {
+    
+    private final DatabaseNode master;
+    private final List<DatabaseNode> slaves;
+    private final ReplicationLog replicationLog;
+    
+    public MasterSlaveReplication(DatabaseNode master, List<DatabaseNode> slaves) {
+        this.master = master;
+        this.slaves = slaves;
+        this.replicationLog = new ReplicationLog();
+    }
+    
+    // All writes go to master
+    public void writeData(String key, Object value) {
+        try {
+            // 1. Write to master first
+            master.write(key, value);
+            
+            // 2. Log the operation
+            ReplicationLogEntry logEntry = new ReplicationLogEntry(
+                System.currentTimeMillis(), "WRITE", key, value);
+            replicationLog.append(logEntry);
+            
+            // 3. Replicate to slaves asynchronously
+            CompletableFuture.runAsync(() -> {
+                replicateToSlaves(logEntry);
+            });
+            
+        } catch (Exception e) {
+            throw new WriteFailedException("Failed to write to master", e);
+        }
+    }
+    
+    // Reads can go to any replica
+    public Object readData(String key) {
+        // Read from master for strong consistency
+        if (requiresStrongConsistency()) {
+            return master.read(key);
+        }
+        
+        // Read from slave for better performance (eventual consistency)
+        DatabaseNode selectedSlave = selectHealthySlave();
+        return selectedSlave.read(key);
+    }
+    
+    private void replicateToSlaves(ReplicationLogEntry logEntry) {
+        List<CompletableFuture<Void>> replicationFutures = new ArrayList<>();
+        
+        for (DatabaseNode slave : slaves) {
+            CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+                try {
+                    slave.applyLogEntry(logEntry);
+                } catch (Exception e) {
+                    log.error("Replication failed to slave: " + slave.getId(), e);
+                    handleReplicationFailure(slave, logEntry);
+                }
+            });
+            replicationFutures.add(future);
+        }
+        
+        // Wait for majority of replicas to succeed
+        int successCount = 0;
+        for (CompletableFuture<Void> future : replicationFutures) {
+            try {
+                future.get(5, TimeUnit.SECONDS);
+                successCount++;
+            } catch (Exception e) {
+                log.warn("Replication timeout or failure", e);
+            }
+        }
+        
+        if (successCount < slaves.size() / 2) {
+            log.error("Majority replication failed for entry: " + logEntry);
+        }
+    }
+    
+    // Handle slave failure and recovery
+    private void handleReplicationFailure(DatabaseNode failedSlave, ReplicationLogEntry failedEntry) {
+        // Mark slave as unhealthy
+        healthMonitor.markUnhealthy(failedSlave);
+        
+        // Queue entry for retry
+        retryQueue.add(new RetryTask(failedSlave, failedEntry));
+        
+        // When slave recovers, catch up with missed entries
+        CompletableFuture.runAsync(() -> {
+            waitForSlaveRecovery(failedSlave);
+            catchUpSlave(failedSlave);
+        });
+    }
+    
+    private void catchUpSlave(DatabaseNode slave) {
+        // Get slave's last applied log position
+        long lastAppliedPosition = slave.getLastAppliedLogPosition();
+        
+        // Get all log entries since that position
+        List<ReplicationLogEntry> missedEntries = 
+            replicationLog.getEntriesSince(lastAppliedPosition);
+        
+        // Apply missed entries in order
+        for (ReplicationLogEntry entry : missedEntries) {
+            slave.applyLogEntry(entry);
+        }
+        
+        // Mark slave as healthy again
+        healthMonitor.markHealthy(slave);
+    }
+}
+```
+
+2. **Master-Master Replication (Multi-Master)**
+```java
+// Multi-master replication with conflict resolution
+public class MultiMasterReplication {
+    
+    private final List<DatabaseNode> masters;
+    private final ConflictResolver conflictResolver;
+    private final VectorClockService vectorClockService;
+    
+    // Write to any master
+    public void writeData(String key, Object value, String writingNodeId) {
+        DatabaseNode writingNode = findMasterById(writingNodeId);
+        
+        // 1. Generate vector clock for this write
+        VectorClock vectorClock = vectorClockService.generateClock(writingNodeId);
+        
+        // 2. Write locally with timestamp
+        VersionedValue versionedValue = new VersionedValue(value, vectorClock);
+        writingNode.write(key, versionedValue);
+        
+        // 3. Asynchronously replicate to other masters
+        for (DatabaseNode master : masters) {
+            if (!master.getId().equals(writingNodeId)) {
+                CompletableFuture.runAsync(() -> {
+                    master.replicate(key, versionedValue);
+                });
+            }
+        }
+    }
+    
+    // Read with conflict resolution
+    public Object readData(String key) {
+        List<VersionedValue> versions = new ArrayList<>();
+        
+        // 1. Read from all available masters
+        for (DatabaseNode master : masters) {
+            try {
+                VersionedValue version = master.readVersioned(key);
+                if (version != null) {
+                    versions.add(version);
+                }
+            } catch (NodeUnavailableException e) {
+                // Skip unavailable nodes
+                continue;
+            }
+        }
+        
+        if (versions.isEmpty()) {
+            throw new DataNotFoundException("Key not found: " + key);
+        }
+        
+        // 2. Resolve conflicts if multiple versions exist
+        if (versions.size() == 1) {
+            return versions.get(0).getValue();
+        } else {
+            return conflictResolver.resolve(versions);
+        }
+    }
+    
+    // Vector clock-based conflict resolution
+    public static class VectorClockConflictResolver implements ConflictResolver {
+        
+        @Override
+        public Object resolve(List<VersionedValue> conflictingVersions) {
+            // Find versions that are not superseded by others
+            List<VersionedValue> concurrent = new ArrayList<>();
+            
+            for (VersionedValue version1 : conflictingVersions) {
+                boolean isSuperseded = false;
+                
+                for (VersionedValue version2 : conflictingVersions) {
+                    if (version1 != version2 && 
+                        version2.getVectorClock().happensBefore(version1.getVectorClock())) {
+                        isSuperseded = true;
+                        break;
+                    }
+                }
+                
+                if (!isSuperseded) {
+                    concurrent.add(version1);
+                }
+            }
+            
+            if (concurrent.size() == 1) {
+                return concurrent.get(0).getValue();
+            } else {
+                // Multiple concurrent versions - use application-specific resolution
+                return resolveApplicationConflict(concurrent);
+            }
+        }
+        
+        private Object resolveApplicationConflict(List<VersionedValue> concurrentVersions) {
+            // Application-specific conflict resolution strategies:
+            
+            // 1. Last-write-wins (based on wall clock)
+            return concurrentVersions.stream()
+                .max(Comparator.comparing(v -> v.getVectorClock().getWallClockTime()))
+                .map(VersionedValue::getValue)
+                .orElse(null);
+            
+            // 2. Merge conflicts (for mergeable data types)
+            // return mergeValues(concurrentVersions);
+            
+            // 3. User-defined resolution
+            // return userDefinedResolver.resolve(concurrentVersions);
+        }
+    }
+}
+```
+
+3. **Quorum-Based Replication**
+```java
+// Quorum replication for tunable consistency
+public class QuorumReplication {
+    
+    private final List<DatabaseNode> replicas;
+    private final int replicationFactor;
+    
+    public QuorumReplication(List<DatabaseNode> replicas) {
+        this.replicas = replicas;
+        this.replicationFactor = replicas.size();
+    }
+    
+    // Configurable consistency levels
+    public void writeWithQuorum(String key, Object value, ConsistencyLevel consistency) {
+        int requiredWrites = calculateRequiredWrites(consistency);
+        
+        List<CompletableFuture<WriteResult>> writeFutures = new ArrayList<>();
+        
+        // Write to all replicas in parallel
+        for (DatabaseNode replica : replicas) {
+            CompletableFuture<WriteResult> future = CompletableFuture.supplyAsync(() -> {
+                try {
+                    replica.write(key, value);
+                    return WriteResult.success(replica.getId());
+                } catch (Exception e) {
+                    return WriteResult.failure(replica.getId(), e);
+                }
+            });
+            writeFutures.add(future);
+        }
+        
+        // Wait for required number of successful writes
+        int successCount = 0;
+        List<WriteResult> results = new ArrayList<>();
+        
+        for (CompletableFuture<WriteResult> future : writeFutures) {
+            try {
+                WriteResult result = future.get(5, TimeUnit.SECONDS);
+                results.add(result);
+                
+                if (result.isSuccess()) {
+                    successCount++;
+                    
+                    // Return as soon as we have enough successful writes
+                    if (successCount >= requiredWrites) {
+                        break;
+                    }
+                }
+            } catch (Exception e) {
+                results.add(WriteResult.failure("unknown", e));
+            }
+        }
+        
+        if (successCount < requiredWrites) {
+            throw new InsufficientReplicasException(
+                String.format("Required %d writes, got %d", requiredWrites, successCount));
+        }
+    }
+    
+    public Object readWithQuorum(String key, ConsistencyLevel consistency) {
+        int requiredReads = calculateRequiredReads(consistency);
+        
+        List<CompletableFuture<ReadResult>> readFutures = new ArrayList<>();
+        
+        // Read from replicas in parallel
+        for (DatabaseNode replica : replicas) {
+            CompletableFuture<ReadResult> future = CompletableFuture.supplyAsync(() -> {
+                try {
+                    Object value = replica.read(key);
+                    return ReadResult.success(replica.getId(), value);
+                } catch (Exception e) {
+                    return ReadResult.failure(replica.getId(), e);
+                }
+            });
+            readFutures.add(future);
+        }
+        
+        // Collect results
+        List<ReadResult> results = new ArrayList<>();
+        for (CompletableFuture<ReadResult> future : readFutures) {
+            try {
+                ReadResult result = future.get(2, TimeUnit.SECONDS);
+                results.add(result);
+                
+                if (results.size() >= requiredReads) {
+                    break; // Got enough responses
+                }
+            } catch (Exception e) {
+                results.add(ReadResult.failure("unknown", e));
+            }
+        }
+        
+        // Resolve conflicts if multiple values returned
+        return resolveReadConflicts(results);
+    }
+    
+    private int calculateRequiredWrites(ConsistencyLevel consistency) {
+        switch (consistency) {
+            case ONE: return 1;
+            case QUORUM: return (replicationFactor / 2) + 1;
+            case ALL: return replicationFactor;
+            default: throw new IllegalArgumentException("Unknown consistency level");
+        }
+    }
+    
+    private int calculateRequiredReads(ConsistencyLevel consistency) {
+        switch (consistency) {
+            case ONE: return 1;
+            case QUORUM: return (replicationFactor / 2) + 1;
+            case ALL: return replicationFactor;
+            default: throw new IllegalArgumentException("Unknown consistency level");
+        }
+    }
+}
+
+// Consistency level configuration
+public enum ConsistencyLevel {
+    ONE,     // Fastest, least consistent
+    QUORUM,  // Balanced consistency and performance  
+    ALL      // Strongest consistency, slowest
+}
+```
+
+**Challenges of Replication:**
+
+1. **Replication Lag**
+```java
+// Challenge: Slaves may be behind master
+@Service
+public class ReplicationLagHandler {
+    
+    @Autowired
+    private MasterDatabase master;
+    
+    @Autowired
+    private List<SlaveDatabase> slaves;
+    
+    @Autowired
+    private ReplicationMonitor monitor;
+    
+    public Object readWithLagTolerance(String key, Duration maxLag) {
+        // Check replication lag for each slave
+        for (SlaveDatabase slave : slaves) {
+            Duration currentLag = monitor.getReplicationLag(slave);
+            
+            if (currentLag.compareTo(maxLag) <= 0) {
+                // Slave is sufficiently up-to-date
+                return slave.read(key);
+            }
+        }
+        
+        // All slaves are too far behind, read from master
+        log.warn("All slaves have high replication lag, reading from master");
+        return master.read(key);
+    }
+    
+    // Read-your-writes consistency
+    public Object readAfterWrite(String key, String userId, long writeTimestamp) {
+        // Ensure user sees their own writes
+        for (SlaveDatabase slave : slaves) {
+            long slaveTimestamp = slave.getLastUpdateTimestamp(key);
+            
+            if (slaveTimestamp >= writeTimestamp) {
+                // This slave has the user's write
+                return slave.read(key);
+            }
+        }
+        
+        // No slave has the write yet, read from master
+        return master.read(key);
+    }
+}
+```
+
+2. **Split-Brain Scenarios**
+```java
+// Challenge: Network partition creates multiple masters
+public class SplitBrainPrevention {
+    
+    private final List<DatabaseNode> nodes;
+    private final QuorumService quorumService;
+    
+    public void handleNetworkPartition() {
+        // Detect network partition
+        List<List<DatabaseNode>> partitions = detectNetworkPartitions();
+        
+        for (List<DatabaseNode> partition : partitions) {
+            if (partition.size() > nodes.size() / 2) {
+                // Majority partition can continue as master
+                for (DatabaseNode node : partition) {
+                    node.setRole(NodeRole.MASTER);
+                }
+            } else {
+                // Minority partition becomes read-only
+                for (DatabaseNode node : partition) {
+                    node.setRole(NodeRole.READ_ONLY);
+                }
+            }
+        }
+    }
+    
+    // Quorum-based writes to prevent split-brain
+    public void writeWithQuorum(String key, Object value) {
+        int requiredNodes = (nodes.size() / 2) + 1;
+        
+        List<CompletableFuture<Boolean>> writeFutures = new ArrayList<>();
+        
+        for (DatabaseNode node : nodes) {
+            CompletableFuture<Boolean> future = CompletableFuture.supplyAsync(() -> {
+                try {
+                    node.write(key, value);
+                    return true;
+                } catch (Exception e) {
+                    return false;
+                }
+            });
+            writeFutures.add(future);
+        }
+        
+        // Count successful writes
+        long successCount = writeFutures.stream()
+            .map(future -> {
+                try {
+                    return future.get(2, TimeUnit.SECONDS);
+                } catch (Exception e) {
+                    return false;
+                }
+            })
+            .mapToLong(success -> success ? 1 : 0)
+            .sum();
+        
+        if (successCount < requiredNodes) {
+            throw new QuorumNotReachedException(
+                String.format("Required %d nodes, got %d", requiredNodes, successCount));
+        }
+    }
+}
+```
+
+3. **Conflict Resolution Strategies**
+```java
+// Different conflict resolution approaches
+public class ConflictResolutionStrategies {
+    
+    // 1. Last-Write-Wins (LWW)
+    public static class LastWriteWinsResolver implements ConflictResolver {
+        
+        @Override
+        public Object resolve(List<VersionedValue> conflictingValues) {
+            return conflictingValues.stream()
+                .max(Comparator.comparing(VersionedValue::getTimestamp))
+                .map(VersionedValue::getValue)
+                .orElse(null);
+        }
+    }
+    
+    // 2. Application-Specific Merge
+    public static class ShoppingCartMergeResolver implements ConflictResolver {
+        
+        @Override
+        public Object resolve(List<VersionedValue> conflictingValues) {
+            // Merge shopping carts by combining items
+            ShoppingCart mergedCart = new ShoppingCart();
+            
+            for (VersionedValue version : conflictingValues) {
+                ShoppingCart cart = (ShoppingCart) version.getValue();
+                
+                for (CartItem item : cart.getItems()) {
+                    // Add quantities for same product
+                    mergedCart.addItem(item.getProductId(), item.getQuantity());
+                }
+            }
+            
+            return mergedCart;
+        }
+    }
+    
+    // 3. CRDT (Conflict-free Replicated Data Types)
+    public static class CRDTCounterResolver implements ConflictResolver {
+        
+        @Override
+        public Object resolve(List<VersionedValue> conflictingValues) {
+            // G-Counter (Grow-only counter) - always merge by taking maximum
+            Map<String, Long> mergedCounter = new HashMap<>();
+            
+            for (VersionedValue version : conflictingValues) {
+                @SuppressWarnings("unchecked")
+                Map<String, Long> counter = (Map<String, Long>) version.getValue();
+                
+                for (Map.Entry<String, Long> entry : counter.entrySet()) {
+                    String nodeId = entry.getKey();
+                    Long count = entry.getValue();
+                    
+                    mergedCounter.put(nodeId, 
+                        Math.max(mergedCounter.getOrDefault(nodeId, 0L), count));
+                }
+            }
+            
+            return mergedCounter;
+        }
+    }
+    
+    // 4. User-Defined Resolution
+    public static class UserDefinedResolver implements ConflictResolver {
+        
+        @Override
+        public Object resolve(List<VersionedValue> conflictingValues) {
+            // Present conflicts to user for manual resolution
+            ConflictResolutionRequest request = new ConflictResolutionRequest(
+                conflictingValues.stream()
+                    .map(VersionedValue::getValue)
+                    .collect(Collectors.toList())
+            );
+            
+            // Store conflict for user resolution
+            conflictQueue.add(request);
+            
+            // Return most recent version temporarily
+            return conflictingValues.stream()
+                .max(Comparator.comparing(VersionedValue::getTimestamp))
+                .map(VersionedValue::getValue)
+                .orElse(null);
+        }
+    }
+}
+```
+
+**Benefits of Replication:**
+
+1. **High Availability**
+```java
+// Automatic failover with replication
+@Component
+public class HighAvailabilityService {
+    
+    @Autowired
+    private HealthCheckService healthCheck;
+    
+    @Autowired
+    private LoadBalancer loadBalancer;
+    
+    @EventListener
+    public void handleNodeFailure(NodeFailureEvent event) {
+        DatabaseNode failedNode = event.getFailedNode();
+        
+        // Remove failed node from load balancer
+        loadBalancer.removeNode(failedNode);
+        
+        // Promote slave to master if master failed
+        if (failedNode.getRole() == NodeRole.MASTER) {
+            DatabaseNode bestSlave = selectBestSlaveForPromotion();
+            promoteSlaveToMaster(bestSlave);
+        }
+        
+        // Start recovery process
+        CompletableFuture.runAsync(() -> {
+            recoverFailedNode(failedNode);
+        });
+    }
+    
+    private DatabaseNode selectBestSlaveForPromotion() {
+        return slaves.stream()
+            .filter(slave -> healthCheck.isHealthy(slave))
+            .min(Comparator.comparing(slave -> 
+                replicationMonitor.getReplicationLag(slave)))
+            .orElseThrow(() -> new NoHealthySlavesException());
+    }
+}
+```
+
+2. **Read Scalability**
+```java
+// Scale reads across multiple replicas
+@Service
+public class ReadScalableService {
+    
+    private final DatabaseNode master;
+    private final List<DatabaseNode> readReplicas;
+    private final LoadBalancer readLoadBalancer;
+    
+    public Object readData(String key, ReadConsistency consistency) {
+        switch (consistency) {
+            case STRONG:
+                // Read from master for strong consistency
+                return master.read(key);
+                
+            case EVENTUAL:
+                // Read from any replica for better performance
+                DatabaseNode replica = readLoadBalancer.selectNode(readReplicas);
+                return replica.read(key);
+                
+            case BOUNDED_STALENESS:
+                // Read from replica with acceptable lag
+                for (DatabaseNode replica : readReplicas) {
+                    if (replicationMonitor.getReplicationLag(replica).toSeconds() < 5) {
+                        return replica.read(key);
+                    }
+                }
+                // Fallback to master if all replicas are too stale
+                return master.read(key);
+                
+            default:
+                throw new IllegalArgumentException("Unknown consistency level");
+        }
+    }
+}
+```
+
+**Real-World Example: Cassandra's Replication**
+```java
+// Cassandra-style replication strategy
+public class CassandraStyleReplication {
+    
+    // Simple replication strategy
+    public void configureSimpleStrategy(int replicationFactor) {
+        // Replicas placed on consecutive nodes in the ring
+        CreateKeyspaceStatement statement = SchemaBuilder.createKeyspace("my_keyspace")
+            .ifNotExists()
+            .with()
+            .replication(ImmutableMap.of(
+                "class", "SimpleStrategy",
+                "replication_factor", replicationFactor
+            ));
+    }
+    
+    // Network topology aware replication
+    public void configureNetworkTopologyStrategy() {
+        // Replicas distributed across data centers
+        CreateKeyspaceStatement statement = SchemaBuilder.createKeyspace("my_keyspace")
+            .ifNotExists()
+            .with()
+            .replication(ImmutableMap.of(
+                "class", "NetworkTopologyStrategy",
+                "datacenter1", 2,  // 2 replicas in DC1
+                "datacenter2", 1   // 1 replica in DC2
+            ));
+    }
+    
+    // Tunable consistency
+    public void demonstrateTunableConsistency() {
+        Session session = cluster.connect("my_keyspace");
+        
+        // Strong consistency: R + W > N
+        PreparedStatement strongWrite = session.prepare(
+            "INSERT INTO users (id, name, email) VALUES (?, ?, ?)");
+        
+        session.execute(strongWrite.bind("user1", "John", "john@example.com")
+            .setConsistencyLevel(ConsistencyLevel.QUORUM)); // W = 2
+        
+        ResultSet result = session.execute(
+            session.prepare("SELECT * FROM users WHERE id = ?")
+                .bind("user1")
+                .setConsistencyLevel(ConsistencyLevel.QUORUM)); // R = 2
+        
+        // R + W = 4 > N = 3, guarantees strong consistency
+    }
+}
+```
+
+This enhanced explanation provides comprehensive coverage of stateless services, data partitioning, and replication strategies with their challenges, solutions, and real-world implementations.
