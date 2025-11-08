@@ -33,14 +33,547 @@ A **compute engine** is a software framework that executes computational tasks o
 
 ### Key Design Dimensions
 
-| Dimension | Description | Examples |
-|-----------|-------------|----------|
-| **Execution Model** | How tasks are executed | Batch, Stream, Interactive |
-| **Data Model** | How data is represented | Row-based, Columnar, Graph |
-| **Memory Management** | How memory is utilized | In-memory, Disk-based, Hybrid |
-| **Fault Tolerance** | How failures are handled | Checkpointing, Replication, Lineage |
-| **Scalability** | How system scales | Horizontal, Vertical, Elastic |
-| **Latency** | Response time characteristics | Real-time, Near real-time, Batch |
+#### 1. Execution Model
+
+The execution model defines how computational tasks are scheduled, executed, and coordinated across the system.
+
+##### Batch Execution Model
+```
+Characteristics:
+├── Finite Data Sets: Process complete datasets
+├── High Throughput: Optimize for maximum data processing rate
+├── Scheduled Execution: Jobs run at specific times or intervals
+├── Resource Allocation: Allocate resources for entire job duration
+└── Fault Recovery: Can restart entire job or failed stages
+
+Implementation Pattern:
+┌─────────────────────────────────────────────────────────┐
+│  Job Submission → Resource Allocation → Task Execution  │
+│       ↓                    ↓                    ↓       │
+│  Job Queue      →    Cluster Manager    →   Workers     │
+│       ↓                    ↓                    ↓       │
+│  Scheduling     →    Resource Tracking  →   Results     │
+└─────────────────────────────────────────────────────────┘
+
+Examples: MapReduce, Spark (batch mode), Tez
+Best For: ETL, data warehousing, ML training, historical analysis
+```
+
+```java
+// Batch execution example - Spark
+public class BatchProcessingExample {
+    
+    public void processDailyBatch(SparkSession spark, String date) {
+        // Read entire day's data
+        Dataset<Row> dailyData = spark.read()
+            .option("basePath", "s3://data-lake/transactions/")
+            .parquet(String.format("s3://data-lake/transactions/date=%s", date));
+        
+        // Process complete dataset
+        Dataset<Row> aggregated = dailyData
+            .groupBy("customer_id", "product_category")
+            .agg(
+                sum("amount").as("total_spent"),
+                count("*").as("transaction_count"),
+                avg("amount").as("avg_transaction")
+            );
+        
+        // Write results (all-or-nothing)
+        aggregated.write()
+            .mode("overwrite")
+            .partitionBy("product_category")
+            .parquet("s3://data-lake/daily-summaries/date=" + date);
+    }
+}
+```
+
+##### Stream Execution Model
+```
+Characteristics:
+├── Infinite Data Streams: Process continuous data flows
+├── Low Latency: Optimize for minimal processing delay
+├── Continuous Execution: Always-on processing
+├── Dynamic Resource Allocation: Scale resources based on load
+└── Incremental Recovery: Recover from last checkpoint
+
+Implementation Pattern:
+┌─────────────────────────────────────────────────────────┐
+│  Stream Ingestion → Continuous Processing → Output      │
+│         ↓                    ↓                  ↓       │
+│    Data Sources    →    Stream Processor   →  Sinks     │
+│         ↓                    ↓                  ↓       │
+│    Buffering       →    State Management   →  Results   │
+└─────────────────────────────────────────────────────────┘
+
+Examples: Flink, Storm, Kafka Streams
+Best For: Real-time analytics, fraud detection, monitoring
+```
+
+```java
+// Stream execution example - Flink
+public class StreamProcessingExample {
+    
+    public void processRealTimeEvents(StreamExecutionEnvironment env) {
+        // Continuous data ingestion
+        DataStream<Event> eventStream = env
+            .addSource(new KafkaSource<>("events-topic"))
+            .assignTimestampsAndWatermarks(
+                WatermarkStrategy.<Event>forBoundedOutOfOrderness(Duration.ofSeconds(5))
+                    .withTimestampAssigner((event, timestamp) -> event.getEventTime())
+            );
+        
+        // Continuous processing with windowing
+        DataStream<WindowResult> results = eventStream
+            .keyBy(Event::getUserId)
+            .window(TumblingEventTimeWindows.of(Time.minutes(1)))
+            .process(new EventWindowProcessor());
+        
+        // Continuous output
+        results.addSink(new KafkaSink<>("results-topic"));
+        
+        // Start continuous execution
+        env.execute("Real-time Event Processing");
+    }
+}
+```
+
+##### Interactive Execution Model
+```
+Characteristics:
+├── Ad-hoc Queries: User-initiated queries
+├── Sub-second Response: Optimize for query latency
+├── Concurrent Users: Support multiple simultaneous queries
+├── Resource Sharing: Share resources across queries
+└── Query Optimization: Optimize individual query performance
+
+Implementation Pattern:
+┌─────────────────────────────────────────────────────────┐
+│  Query Submission → Query Planning → Execution          │
+│         ↓                 ↓              ↓              │
+│    Query Parser    →   Optimizer    →  Executors        │
+│         ↓                 ↓              ↓              │
+│    Metadata Lookup →   Cost Model   →  Results          │
+└─────────────────────────────────────────────────────────┘
+
+Examples: Trino, Impala, Drill
+Best For: Business intelligence, data exploration, dashboards
+```
+
+```sql
+-- Interactive execution example - Trino
+-- Query executes immediately with sub-second response
+SELECT 
+    region,
+    product_category,
+    COUNT(*) as order_count,
+    SUM(amount) as total_revenue,
+    AVG(amount) as avg_order_value
+FROM iceberg.sales.orders o
+JOIN postgresql.crm.customers c ON o.customer_id = c.customer_id
+WHERE o.order_date >= CURRENT_DATE - INTERVAL '30' DAY
+GROUP BY region, product_category
+ORDER BY total_revenue DESC
+LIMIT 100;
+```
+
+#### 2. Data Model
+
+The data model determines how data is structured, stored, and accessed within the compute engine.
+
+##### Row-Based Data Model
+```
+Structure:
+Record 1: [col1_val1, col2_val1, col3_val1, col4_val1]
+Record 2: [col1_val2, col2_val2, col3_val2, col4_val2]
+Record 3: [col1_val3, col2_val3, col3_val3, col4_val3]
+
+Storage Layout:
+┌─────────────────────────────────────────────────────────┐
+│ [R1C1][R1C2][R1C3][R1C4][R2C1][R2C2][R2C3][R2C4]...  │
+└─────────────────────────────────────────────────────────┘
+
+Characteristics:
+├── OLTP Optimized: Fast single-record operations
+├── Write Efficient: Easy to insert/update records
+├── Random Access: Quick access to individual records
+└── Poor Analytics: Must read entire records for column operations
+
+Examples: Traditional RDBMS, MongoDB, Cassandra
+Best For: Transactional workloads, CRUD operations
+```
+
+```java
+// Row-based processing example
+public class RowBasedProcessor {
+    
+    public void processCustomerOrders(List<CustomerOrder> orders) {
+        for (CustomerOrder order : orders) {
+            // Process entire record at once
+            if (order.getAmount() > 1000) {
+                // Access all fields of the record
+                processLargeOrder(
+                    order.getCustomerId(),
+                    order.getProductId(),
+                    order.getAmount(),
+                    order.getOrderDate(),
+                    order.getShippingAddress()
+                );
+            }
+        }
+    }
+}
+```
+
+##### Columnar Data Model
+```
+Structure:
+Column 1: [col1_val1, col1_val2, col1_val3, ...]
+Column 2: [col2_val1, col2_val2, col2_val3, ...]
+Column 3: [col3_val1, col3_val2, col3_val3, ...]
+
+Storage Layout:
+┌─────────────────────────────────────────────────────────┐
+│ [C1R1][C1R2][C1R3]...[C2R1][C2R2][C2R3]...[C3R1]...  │
+└─────────────────────────────────────────────────────────┘
+
+Characteristics:
+├── OLAP Optimized: Fast analytical operations
+├── Compression Friendly: Similar values compress well
+├── Vectorized Processing: Process multiple values simultaneously
+└── Column Pruning: Read only needed columns
+
+Examples: Parquet, ORC, ClickHouse, Vertica
+Best For: Analytics, aggregations, reporting
+```
+
+```java
+// Columnar processing example
+public class ColumnarProcessor {
+    
+    public double calculateTotalRevenue(ColumnarBatch batch) {
+        // Process entire column at once
+        DoubleColumnVector amounts = batch.getDoubleColumn("amount");
+        
+        // Vectorized operation
+        double total = 0.0;
+        for (int i = 0; i < amounts.length(); i += 8) {
+            // Process 8 values simultaneously using SIMD
+            total += vectorizedSum(amounts, i, Math.min(i + 8, amounts.length()));
+        }
+        
+        return total;
+    }
+    
+    // Native SIMD implementation
+    private native double vectorizedSum(DoubleColumnVector vector, int start, int end);
+}
+```
+
+##### Graph Data Model
+```
+Structure:
+Vertices: [V1{props}, V2{props}, V3{props}, ...]
+Edges: [E1{V1→V2, props}, E2{V2→V3, props}, ...]
+
+Representation:
+     V1 ──E1──→ V2
+     │          │
+     E3         E2
+     ↓          ↓
+     V3 ──E4──→ V4
+
+Characteristics:
+├── Relationship Focused: Optimized for traversals
+├── Complex Queries: Multi-hop relationship queries
+├── Graph Algorithms: PageRank, shortest path, clustering
+└── Specialized Storage: Graph-optimized storage formats
+
+Examples: Neo4j, Amazon Neptune, Apache Giraph
+Best For: Social networks, recommendation engines, fraud detection
+```
+
+```java
+// Graph processing example - Apache Spark GraphX
+public class GraphProcessor {
+    
+    public void analyzeUserNetwork(JavaSparkContext sc) {
+        // Create graph from vertices and edges
+        JavaRDD<Tuple2<Object, String>> vertices = sc.parallelize(Arrays.asList(
+            new Tuple2<>(1L, "Alice"),
+            new Tuple2<>(2L, "Bob"),
+            new Tuple2<>(3L, "Charlie")
+        ));
+        
+        JavaRDD<Edge<String>> edges = sc.parallelize(Arrays.asList(
+            new Edge<>(1L, 2L, "friend"),
+            new Edge<>(2L, 3L, "colleague"),
+            new Edge<>(1L, 3L, "friend")
+        ));
+        
+        Graph<String, String> graph = Graph.apply(
+            vertices.rdd(), edges.rdd(), "Unknown", 
+            StorageLevel.MEMORY_ONLY(), StorageLevel.MEMORY_ONLY(),
+            scala.reflect.ClassTag$.MODULE$.apply(String.class),
+            scala.reflect.ClassTag$.MODULE$.apply(String.class)
+        );
+        
+        // Run PageRank algorithm
+        Graph<Double, String> pageRankGraph = graph.pageRank(0.0001, 0.15);
+        
+        // Find influential users
+        JavaRDD<Tuple2<Object, Double>> rankings = pageRankGraph.vertices().toJavaRDD();
+        rankings.foreach(ranking -> 
+            System.out.println("User " + ranking._1() + " has rank " + ranking._2())
+        );
+    }
+}
+```
+
+#### 3. Memory Management
+
+Memory management strategies determine how the compute engine utilizes available memory resources.
+
+##### In-Memory Processing
+```
+Characteristics:
+├── Data Caching: Keep frequently accessed data in RAM
+├── Fast Access: Memory access 100x faster than disk
+├── Iterative Algorithms: Excellent for ML and graph algorithms
+├── Memory Pressure: Limited by available RAM
+└── Fault Recovery: May need to recompute cached data
+
+Memory Hierarchy:
+┌─────────────────────────────────────────────────────────┐
+│  CPU Cache (L1/L2/L3) ← Fastest, smallest              │
+│         ↕                                               │
+│  Main Memory (RAM) ← Fast, medium size                  │
+│         ↕                                               │
+│  SSD Storage ← Medium speed, large size                 │
+│         ↕                                               │
+│  HDD Storage ← Slow, largest size                       │
+└─────────────────────────────────────────────────────────┘
+
+Examples: Spark (RDD caching), Redis, SAP HANA
+Best For: Iterative algorithms, interactive analytics
+```
+
+```scala
+// In-memory processing example - Spark
+class InMemoryProcessor(spark: SparkSession) {
+  
+  def processIterativeAlgorithm(): Unit = {
+    import spark.implicits._
+    
+    // Load data and cache in memory
+    val data = spark.read.parquet("hdfs://data/large-dataset")
+      .cache() // Keep in memory for reuse
+    
+    // Iterative algorithm (e.g., K-means clustering)
+    var centroids = initializeCentroids()
+    var converged = false
+    var iteration = 0
+    
+    while (!converged && iteration < 100) {
+      // Each iteration reuses cached data
+      val newCentroids = data
+        .map(point => assignToClosestCentroid(point, centroids))
+        .groupByKey()
+        .mapGroups((clusterId, points) => computeCentroid(points))
+        .collect()
+      
+      converged = hasConverged(centroids, newCentroids)
+      centroids = newCentroids
+      iteration += 1
+    }
+    
+    // Memory management
+    data.unpersist() // Release memory when done
+  }
+  
+  def configureMemoryManagement(): SparkSession = {
+    SparkSession.builder()
+      .config("spark.sql.adaptive.enabled", "true")
+      .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
+      .config("spark.executor.memory", "8g")
+      .config("spark.executor.memoryFraction", "0.8") // 80% for caching
+      .config("spark.storage.memoryFraction", "0.6")  // 60% of executor memory for storage
+      .getOrCreate()
+  }
+}
+```
+
+##### Disk-Based Processing
+```
+Characteristics:
+├── Persistent Storage: Data stored on disk between operations
+├── Unlimited Scale: Not limited by memory size
+├── Fault Tolerance: Data survives node failures
+├── Higher Latency: Disk I/O is slower than memory
+└── Sequential Access: Optimized for sequential reads/writes
+
+Processing Pattern:
+┌─────────────────────────────────────────────────────────┐
+│  Read from Disk → Process → Write to Disk → Next Stage  │
+│         ↓              ↓           ↓            ↓       │
+│    HDFS/S3      →  CPU/Memory  →  HDFS/S3  →  Pipeline  │
+└─────────────────────────────────────────────────────────┘
+
+Examples: MapReduce, traditional databases
+Best For: Large-scale batch processing, data archival
+```
+
+```java
+// Disk-based processing example - MapReduce
+public class DiskBasedProcessor {
+    
+    // Mapper: Read from disk, process, write intermediate results to disk
+    public static class TokenizerMapper extends Mapper<Object, Text, Text, IntWritable> {
+        
+        private final static IntWritable one = new IntWritable(1);
+        private Text word = new Text();
+        
+        public void map(Object key, Text value, Context context) 
+                throws IOException, InterruptedException {
+            
+            // Read from HDFS
+            StringTokenizer itr = new StringTokenizer(value.toString());
+            while (itr.hasMoreTokens()) {
+                word.set(itr.nextToken());
+                // Write intermediate results to local disk
+                context.write(word, one);
+            }
+        }
+    }
+    
+    // Reducer: Read intermediate results from disk, process, write final results to disk
+    public static class IntSumReducer extends Reducer<Text, IntWritable, Text, IntWritable> {
+        
+        private IntWritable result = new IntWritable();
+        
+        public void reduce(Text key, Iterable<IntWritable> values, Context context) 
+                throws IOException, InterruptedException {
+            
+            int sum = 0;
+            // Read intermediate results from disk (after shuffle/sort)
+            for (IntWritable val : values) {
+                sum += val.get();
+            }
+            
+            result.set(sum);
+            // Write final results to HDFS
+            context.write(key, result);
+        }
+    }
+}
+```
+
+##### Hybrid Memory Management
+```
+Characteristics:
+├── Intelligent Caching: Cache hot data, spill cold data to disk
+├── Memory Pressure Handling: Graceful degradation under memory pressure
+├── Adaptive Behavior: Adjust caching strategy based on workload
+├── Best of Both Worlds: Performance of in-memory + scale of disk-based
+└── Complex Management: Requires sophisticated memory management
+
+Memory Tiers:
+┌─────────────────────────────────────────────────────────┐
+│  Hot Data (Memory) ← Frequently accessed               │
+│         ↕                                               │
+│  Warm Data (SSD) ← Occasionally accessed               │
+│         ↕                                               │
+│  Cold Data (HDD) ← Rarely accessed                     │
+└─────────────────────────────────────────────────────────┘
+
+Examples: Spark (with spill-to-disk), Flink (managed memory), Alluxio
+Best For: Mixed workloads, large-scale analytics with memory constraints
+```
+
+```java
+// Hybrid memory management example - Flink
+public class HybridMemoryManager {
+    
+    public void configureFlinkMemoryManagement(StreamExecutionEnvironment env) {
+        Configuration config = new Configuration();
+        
+        // Total process memory
+        config.setString("taskmanager.memory.process.size", "8g");
+        
+        // Managed memory (for state backends, batch operations)
+        config.setString("taskmanager.memory.managed.fraction", "0.4"); // 40% of total
+        
+        // Network memory (for data exchange)
+        config.setString("taskmanager.memory.network.fraction", "0.1"); // 10% of total
+        
+        // JVM heap memory (for user code, framework)
+        config.setString("taskmanager.memory.task.heap.size", "3g");
+        
+        // Off-heap memory (for RocksDB state backend)
+        config.setString("taskmanager.memory.task.off-heap.size", "1g");
+        
+        // Configure state backend with hybrid storage
+        RocksDBStateBackend stateBackend = new RocksDBStateBackend("hdfs://checkpoints/");
+        stateBackend.setDbStoragePath("/tmp/rocksdb"); // Local SSD for hot data
+        
+        // Memory management options
+        RocksDBOptions options = new RocksDBOptions();
+        options.setUseManagedMemory(true); // Use Flink's managed memory
+        options.setWriteBufferSize(64 * 1024 * 1024); // 64MB write buffer
+        options.setMaxWriteBufferNumber(3); // Allow 3 write buffers
+        
+        stateBackend.setRocksDBOptions(options);
+        env.setStateBackend(stateBackend);
+    }
+    
+    // Custom memory-aware processing function
+    public static class MemoryAwareProcessor extends KeyedProcessFunction<String, Event, Result> {
+        
+        private ValueState<EventAccumulator> accumulatorState;
+        private MapState<String, Long> countersState;
+        
+        @Override
+        public void open(Configuration parameters) {
+            // Configure state with memory management
+            ValueStateDescriptor<EventAccumulator> accDesc = 
+                new ValueStateDescriptor<>("accumulator", EventAccumulator.class);
+            accDesc.enableTimeToLive(StateTtlConfig.newBuilder(Time.hours(24))
+                .setUpdateType(StateTtlConfig.UpdateType.OnCreateAndWrite)
+                .setStateVisibility(StateTtlConfig.StateVisibility.NeverReturnExpired)
+                .build());
+            
+            accumulatorState = getRuntimeContext().getState(accDesc);
+            
+            // Map state for counters (automatically managed by Flink)
+            MapStateDescriptor<String, Long> counterDesc = 
+                new MapStateDescriptor<>("counters", String.class, Long.class);
+            countersState = getRuntimeContext().getMapState(counterDesc);
+        }
+        
+        @Override
+        public void processElement(Event event, Context ctx, Collector<Result> out) throws Exception {
+            // Flink automatically manages memory for state access
+            EventAccumulator acc = accumulatorState.value();
+            if (acc == null) {
+                acc = new EventAccumulator();
+            }
+            
+            // Update accumulator (may trigger spill to disk if memory pressure)
+            acc.addEvent(event);
+            accumulatorState.update(acc);
+            
+            // Update counters (managed memory handles overflow)
+            Long count = countersState.get(event.getType());
+            countersState.put(event.getType(), (count == null ? 0 : count) + 1);
+            
+            // Emit result if threshold reached
+            if (acc.getEventCount() >= 1000) {
+                out.collect(new Result(ctx.getCurrentKey(), acc.getSummary()));
+                accumulatorState.clear(); // Free memory
+            }
+        }
+    }
+}
+```
 
 ## Traditional Batch Processing
 
@@ -1638,3 +2171,632 @@ The landscape of compute engines continues to evolve rapidly, driven by:
 4. **Monitor Trends**: Stay informed about emerging technologies
 
 The choice of compute engine significantly impacts system performance, operational complexity, and total cost of ownership. Understanding the trade-offs and evolution trends is crucial for making informed architectural decisions.
+#### 4. Fault Tolerance
+
+Fault tolerance mechanisms determine how the system handles and recovers from failures.
+
+##### Checkpointing-Based Fault Tolerance
+```
+Mechanism:
+├── Periodic Snapshots: Save system state at regular intervals
+├── Consistent State: Ensure all components have consistent view
+├── Recovery: Restart from last successful checkpoint
+└── Exactly-Once: Guarantee no data loss or duplication
+
+Checkpoint Process:
+┌─────────────────────────────────────────────────────────┐
+│  Normal Processing → Checkpoint Trigger → State Snapshot│
+│         ↓                    ↓                  ↓       │
+│    Data Flow        →   Barrier Injection  →  Storage   │
+│         ↓                    ↓                  ↓       │
+│    Continue         →   Acknowledgment     →  Complete  │
+└─────────────────────────────────────────────────────────┘
+
+Examples: Flink, Spark Streaming (DStreams)
+Best For: Stream processing, stateful applications
+```
+
+```java
+// Checkpointing example - Flink
+public class CheckpointingFaultTolerance {
+    
+    public void configureCheckpointing(StreamExecutionEnvironment env) {
+        // Enable checkpointing every 5 seconds
+        env.enableCheckpointing(5000);
+        
+        // Checkpoint configuration
+        CheckpointConfig config = env.getCheckpointConfig();
+        
+        // Exactly-once processing guarantees
+        config.setCheckpointingMode(CheckpointingMode.EXACTLY_ONCE);
+        
+        // Minimum pause between checkpoints
+        config.setMinPauseBetweenCheckpoints(500);
+        
+        // Checkpoint timeout
+        config.setCheckpointTimeout(60000);
+        
+        // Allow only one checkpoint at a time
+        config.setMaxConcurrentCheckpoints(1);
+        
+        // Retain checkpoints on job cancellation
+        config.enableExternalizedCheckpoints(
+            CheckpointConfig.ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION
+        );
+        
+        // Configure state backend for checkpoints
+        env.setStateBackend(new RocksDBStateBackend("hdfs://namenode:9000/checkpoints"));
+        
+        // Restart strategy
+        env.setRestartStrategy(RestartStrategies.fixedDelayRestart(
+            3, // number of restart attempts
+            Time.of(10, TimeUnit.SECONDS) // delay between restarts
+        ));
+    }
+    
+    // Stateful function with checkpointing
+    public static class CheckpointedCounter extends RichFlatMapFunction<String, Tuple2<String, Long>> {
+        
+        private ValueState<Long> countState;
+        
+        @Override
+        public void open(Configuration parameters) {
+            ValueStateDescriptor<Long> descriptor = 
+                new ValueStateDescriptor<>("count", Long.class, 0L);
+            countState = getRuntimeContext().getState(descriptor);
+        }
+        
+        @Override
+        public void flatMap(String value, Collector<Tuple2<String, Long>> out) throws Exception {
+            // Get current count (restored from checkpoint if recovering)
+            Long currentCount = countState.value();
+            currentCount++;
+            
+            // Update state (will be included in next checkpoint)
+            countState.update(currentCount);
+            
+            out.collect(new Tuple2<>(value, currentCount));
+        }
+    }
+}
+```
+
+##### Lineage-Based Fault Tolerance
+```
+Mechanism:
+├── Dependency Tracking: Track how data is derived
+├── Lazy Evaluation: Compute only when needed
+├── Recomputation: Recreate lost data from source
+└── Partial Recovery: Recompute only affected partitions
+
+Lineage Graph:
+┌─────────────────────────────────────────────────────────┐
+│  Input Data → Transform 1 → Transform 2 → Transform 3   │
+│      ↓             ↓            ↓            ↓          │
+│   RDD A    →    RDD B    →   RDD C    →   RDD D         │
+│                                ↑                        │
+│                         (Lost partition)                │
+│                                ↓                        │
+│                    Recompute from RDD B                 │
+└─────────────────────────────────────────────────────────┘
+
+Examples: Spark (RDD lineage), MapReduce (task retry)
+Best For: Batch processing, immutable data transformations
+```
+
+```scala
+// Lineage-based fault tolerance - Spark
+class LineageFaultTolerance(spark: SparkSession) {
+  
+  def demonstrateLineageRecovery(): Unit = {
+    import spark.implicits._
+    
+    // Create RDD with lineage tracking
+    val inputData = spark.sparkContext.textFile("hdfs://data/input") // RDD A
+    
+    val words = inputData.flatMap(_.split(" ")) // RDD B (depends on A)
+    
+    val wordPairs = words.map(word => (word, 1)) // RDD C (depends on B)
+    
+    val wordCounts = wordPairs.reduceByKey(_ + _) // RDD D (depends on C)
+    
+    // If any partition of RDD D is lost, Spark can:
+    // 1. Identify the lost partition
+    // 2. Trace back through lineage to find source data
+    // 3. Recompute only the affected partition
+    
+    // Force computation and potential recovery
+    val results = wordCounts.collect()
+    
+    // Lineage information is automatically maintained
+    println("RDD Lineage:")
+    println(wordCounts.toDebugString)
+  }
+  
+  def configureLineageOptimization(): Unit = {
+    // Checkpoint to break long lineage chains
+    val longChainRDD = createLongProcessingChain()
+    
+    // Checkpoint after expensive computation
+    longChainRDD.checkpoint()
+    
+    // Cache frequently accessed RDDs to avoid recomputation
+    val frequentlyUsedRDD = longChainRDD.filter(_.contains("important"))
+    frequentlyUsedRDD.cache()
+    
+    // Use both RDDs - checkpoint and cache reduce recovery time
+    val result1 = frequentlyUsedRDD.count()
+    val result2 = frequentlyUsedRDD.map(_.toUpperCase).collect()
+  }
+}
+```
+
+##### Replication-Based Fault Tolerance
+```
+Mechanism:
+├── Data Replication: Store multiple copies of data
+├── Active Redundancy: Multiple nodes process same data
+├── Consensus Protocols: Agree on correct result
+└── Immediate Recovery: Switch to replica on failure
+
+Replication Strategies:
+┌─────────────────────────────────────────────────────────┐
+│  Master-Slave: One primary, multiple backups           │
+│  Multi-Master: Multiple active replicas                │
+│  Quorum-Based: Majority consensus required             │
+└─────────────────────────────────────────────────────────┘
+
+Examples: HDFS (block replication), Kafka (partition replication)
+Best For: High availability systems, critical data processing
+```
+
+```java
+// Replication-based fault tolerance example
+public class ReplicationFaultTolerance {
+    
+    // HDFS replication configuration
+    public void configureHDFSReplication() {
+        Configuration conf = new Configuration();
+        
+        // Set replication factor (default is 3)
+        conf.setInt("dfs.replication", 3);
+        
+        // Minimum replication for writes
+        conf.setInt("dfs.namenode.replication.min", 2);
+        
+        // Block placement policy
+        conf.set("dfs.block.replicator.classname", 
+                "org.apache.hadoop.hdfs.server.blockmanagement.BlockPlacementPolicyDefault");
+        
+        FileSystem fs = FileSystem.get(conf);
+        
+        // Write file with replication
+        Path filePath = new Path("/data/important-file.txt");
+        FSDataOutputStream out = fs.create(filePath, (short) 3); // 3 replicas
+        out.writeUTF("Critical data that needs high availability");
+        out.close();
+    }
+    
+    // Kafka replication for stream processing
+    public void configureKafkaReplication() {
+        Properties props = new Properties();
+        props.put("bootstrap.servers", "kafka1:9092,kafka2:9092,kafka3:9092");
+        
+        // Producer configuration for replication
+        props.put("acks", "all"); // Wait for all replicas to acknowledge
+        props.put("retries", 3);
+        props.put("batch.size", 16384);
+        props.put("linger.ms", 1);
+        props.put("buffer.memory", 33554432);
+        
+        KafkaProducer<String, String> producer = new KafkaProducer<>(props);
+        
+        // Send message with replication guarantees
+        ProducerRecord<String, String> record = 
+            new ProducerRecord<>("replicated-topic", "key", "value");
+        
+        producer.send(record, (metadata, exception) -> {
+            if (exception != null) {
+                System.err.println("Failed to send message: " + exception.getMessage());
+            } else {
+                System.out.println("Message sent to partition " + metadata.partition() + 
+                                 " with offset " + metadata.offset());
+            }
+        });
+    }
+}
+```
+
+#### 5. Scalability
+
+Scalability determines how the system handles increasing workloads and data volumes.
+
+##### Horizontal Scalability (Scale-Out)
+```
+Characteristics:
+├── Add More Nodes: Increase capacity by adding machines
+├── Distributed Processing: Spread work across nodes
+├── Linear Scaling: Performance increases with node count
+├── Fault Isolation: Node failures don't affect entire system
+└── Cost Effective: Use commodity hardware
+
+Scaling Pattern:
+┌─────────────────────────────────────────────────────────┐
+│  Load Increase → Add Nodes → Redistribute Work          │
+│       ↓              ↓              ↓                  │
+│   Monitoring   →  Auto-scaling  →  Load Balancing       │
+└─────────────────────────────────────────────────────────┘
+
+Examples: Hadoop, Spark, Flink, Cassandra
+Best For: Big data processing, web-scale applications
+```
+
+```java
+// Horizontal scaling example - Spark
+public class HorizontalScaling {
+    
+    public void configureSparkScaling() {
+        SparkConf conf = new SparkConf()
+            .setAppName("Horizontally Scalable App")
+            // Dynamic allocation - add/remove executors based on workload
+            .set("spark.dynamicAllocation.enabled", "true")
+            .set("spark.dynamicAllocation.minExecutors", "2")
+            .set("spark.dynamicAllocation.maxExecutors", "100")
+            .set("spark.dynamicAllocation.initialExecutors", "10")
+            
+            // Scaling policies
+            .set("spark.dynamicAllocation.executorIdleTimeout", "60s")
+            .set("spark.dynamicAllocation.cachedExecutorIdleTimeout", "300s")
+            .set("spark.dynamicAllocation.schedulerBacklogTimeout", "1s")
+            
+            // Resource allocation per executor
+            .set("spark.executor.cores", "4")
+            .set("spark.executor.memory", "8g")
+            .set("spark.executor.memoryFraction", "0.8");
+        
+        JavaSparkContext sc = new JavaSparkContext(conf);
+        
+        // Process data that automatically scales with cluster size
+        JavaRDD<String> data = sc.textFile("hdfs://large-dataset/*");
+        
+        // Repartition based on cluster size for optimal parallelism
+        int optimalPartitions = sc.defaultParallelism() * 3;
+        JavaRDD<String> repartitionedData = data.repartition(optimalPartitions);
+        
+        // Processing automatically distributes across available nodes
+        JavaRDD<String> processed = repartitionedData
+            .filter(line -> line.length() > 0)
+            .map(line -> processLine(line));
+        
+        processed.saveAsTextFile("hdfs://output/");
+    }
+    
+    // Kubernetes-based auto-scaling
+    public void configureKubernetesScaling() {
+        // Spark on Kubernetes with auto-scaling
+        SparkConf conf = new SparkConf()
+            .set("spark.master", "k8s://https://kubernetes-api-server:443")
+            .set("spark.kubernetes.container.image", "spark:3.4.0")
+            .set("spark.kubernetes.namespace", "spark-jobs")
+            
+            // Auto-scaling configuration
+            .set("spark.kubernetes.allocation.batch.size", "5")
+            .set("spark.kubernetes.allocation.batch.delay", "1s")
+            
+            // Resource requests and limits
+            .set("spark.kubernetes.executor.request.cores", "1")
+            .set("spark.kubernetes.executor.limit.cores", "2")
+            .set("spark.kubernetes.executor.request.memory", "2g")
+            .set("spark.kubernetes.executor.limit.memory", "4g");
+    }
+}
+```
+
+##### Vertical Scalability (Scale-Up)
+```
+Characteristics:
+├── Increase Resources: Add CPU, memory, storage to existing nodes
+├── Single Node Optimization: Maximize single-machine performance
+├── Simpler Architecture: No distributed coordination overhead
+├── Hardware Limits: Limited by maximum machine specifications
+└── Higher Cost: Expensive high-end hardware
+
+Scaling Pattern:
+┌─────────────────────────────────────────────────────────┐
+│  Performance Issue → Upgrade Hardware → Optimize Config │
+│         ↓                    ↓                 ↓        │
+│    Monitoring        →   Add Resources   →   Tuning     │
+└─────────────────────────────────────────────────────────┘
+
+Examples: Traditional RDBMS, single-node analytics engines
+Best For: Applications with coordination overhead, legacy systems
+```
+
+```java
+// Vertical scaling example - Single-node optimization
+public class VerticalScaling {
+    
+    public void optimizeSingleNodePerformance() {
+        // Configure for maximum single-node performance
+        SparkConf conf = new SparkConf()
+            .setAppName("Vertically Scaled App")
+            .setMaster("local[*]") // Use all available cores
+            
+            // Maximize memory usage
+            .set("spark.executor.memory", "32g") // Large memory allocation
+            .set("spark.driver.memory", "8g")
+            .set("spark.driver.maxResultSize", "4g")
+            
+            // Optimize for single-node processing
+            .set("spark.sql.adaptive.enabled", "true")
+            .set("spark.sql.adaptive.coalescePartitions.enabled", "true")
+            .set("spark.sql.adaptive.advisoryPartitionSizeInBytes", "128MB")
+            
+            // Memory management
+            .set("spark.storage.memoryFraction", "0.8")
+            .set("spark.shuffle.memoryFraction", "0.2")
+            
+            // Garbage collection optimization
+            .set("spark.executor.extraJavaOptions", 
+                 "-XX:+UseG1GC -XX:+UnlockExperimentalVMOptions " +
+                 "-XX:+UseJVMCICompiler -XX:MaxGCPauseMillis=200");
+        
+        SparkSession spark = SparkSession.builder().config(conf).getOrCreate();
+        
+        // Optimize data processing for single node
+        Dataset<Row> data = spark.read()
+            .option("multiline", "true")
+            .option("inferSchema", "true")
+            .json("large-file.json");
+        
+        // Coalesce to optimal partition count for single node
+        int optimalPartitions = Runtime.getRuntime().availableProcessors();
+        Dataset<Row> optimizedData = data.coalesce(optimalPartitions);
+        
+        // Process with maximum single-node efficiency
+        Dataset<Row> result = optimizedData
+            .groupBy("category")
+            .agg(
+                sum("amount").as("total"),
+                avg("amount").as("average"),
+                count("*").as("count")
+            );
+        
+        result.write().mode("overwrite").parquet("output/");
+    }
+}
+```
+
+##### Elastic Scalability
+```
+Characteristics:
+├── Dynamic Scaling: Automatically adjust resources based on demand
+├── Cost Optimization: Pay only for resources used
+├── Load-Based: Scale up during peak, scale down during low usage
+├── Predictive Scaling: Use historical patterns to anticipate needs
+└── Cloud-Native: Designed for cloud environments
+
+Scaling Triggers:
+┌─────────────────────────────────────────────────────────┐
+│  Metrics Collection → Threshold Analysis → Scaling Action│
+│         ↓                    ↓                  ↓       │
+│    CPU/Memory/Queue  →   Rules Engine    →   Add/Remove │
+│         ↓                    ↓                  ↓       │
+│    Custom Metrics    →   ML Prediction   →   Resources  │
+└─────────────────────────────────────────────────────────┘
+
+Examples: AWS EMR, Google Dataproc, Azure HDInsight
+Best For: Variable workloads, cost-sensitive applications
+```
+
+```python
+# Elastic scaling example - AWS EMR with auto-scaling
+import boto3
+import json
+
+class ElasticScaling:
+    
+    def __init__(self):
+        self.emr = boto3.client('emr')
+        self.cloudwatch = boto3.client('cloudwatch')
+    
+    def create_auto_scaling_cluster(self):
+        """Create EMR cluster with auto-scaling enabled"""
+        
+        # Auto-scaling policy configuration
+        auto_scaling_policy = {
+            "Constraints": {
+                "MinCapacity": 2,
+                "MaxCapacity": 20
+            },
+            "Rules": [
+                {
+                    "Name": "ScaleOutMemoryPercentage",
+                    "Description": "Scale out when memory usage is high",
+                    "Action": {
+                        "Market": "ON_DEMAND",
+                        "SimpleScalingPolicyConfiguration": {
+                            "AdjustmentType": "CHANGE_IN_CAPACITY",
+                            "ScalingAdjustment": 2,
+                            "CoolDown": 300
+                        }
+                    },
+                    "Trigger": {
+                        "CloudWatchAlarmDefinition": {
+                            "ComparisonOperator": "GREATER_THAN",
+                            "EvaluationPeriods": 2,
+                            "MetricName": "MemoryPercentage",
+                            "Namespace": "AWS/ElasticMapReduce",
+                            "Period": 300,
+                            "Statistic": "AVERAGE",
+                            "Threshold": 75.0,
+                            "Unit": "PERCENT"
+                        }
+                    }
+                },
+                {
+                    "Name": "ScaleInMemoryPercentage", 
+                    "Description": "Scale in when memory usage is low",
+                    "Action": {
+                        "SimpleScalingPolicyConfiguration": {
+                            "AdjustmentType": "CHANGE_IN_CAPACITY",
+                            "ScalingAdjustment": -1,
+                            "CoolDown": 300
+                        }
+                    },
+                    "Trigger": {
+                        "CloudWatchAlarmDefinition": {
+                            "ComparisonOperator": "LESS_THAN",
+                            "EvaluationPeriods": 2,
+                            "MetricName": "MemoryPercentage", 
+                            "Namespace": "AWS/ElasticMapReduce",
+                            "Period": 300,
+                            "Statistic": "AVERAGE",
+                            "Threshold": 25.0,
+                            "Unit": "PERCENT"
+                        }
+                    }
+                }
+            ]
+        }
+        
+        # Create cluster with auto-scaling
+        response = self.emr.run_job_flow(
+            Name='Auto-Scaling Spark Cluster',
+            ReleaseLabel='emr-6.4.0',
+            Instances={
+                'InstanceGroups': [
+                    {
+                        'Name': 'Master',
+                        'Market': 'ON_DEMAND',
+                        'InstanceRole': 'MASTER',
+                        'InstanceType': 'm5.xlarge',
+                        'InstanceCount': 1
+                    },
+                    {
+                        'Name': 'Workers',
+                        'Market': 'ON_DEMAND', 
+                        'InstanceRole': 'CORE',
+                        'InstanceType': 'm5.xlarge',
+                        'InstanceCount': 2,
+                        'AutoScalingPolicy': auto_scaling_policy
+                    }
+                ],
+                'Ec2KeyName': 'my-key-pair',
+                'KeepJobFlowAliveWhenNoSteps': True
+            },
+            Applications=[
+                {'Name': 'Spark'},
+                {'Name': 'Hadoop'}
+            ],
+            ServiceRole='EMR_DefaultRole',
+            JobFlowRole='EMR_EC2_DefaultRole'
+        )
+        
+        return response['JobFlowId']
+    
+    def setup_custom_scaling_metrics(self, cluster_id):
+        """Set up custom metrics for more sophisticated scaling"""
+        
+        # Custom metric: Queue depth for pending jobs
+        self.cloudwatch.put_metric_data(
+            Namespace='EMR/CustomMetrics',
+            MetricData=[
+                {
+                    'MetricName': 'PendingJobsCount',
+                    'Dimensions': [
+                        {
+                            'Name': 'ClusterId',
+                            'Value': cluster_id
+                        }
+                    ],
+                    'Value': self.get_pending_jobs_count(cluster_id),
+                    'Unit': 'Count'
+                }
+            ]
+        )
+        
+        # Custom metric: Average job completion time
+        self.cloudwatch.put_metric_data(
+            Namespace='EMR/CustomMetrics',
+            MetricData=[
+                {
+                    'MetricName': 'AvgJobCompletionTime',
+                    'Dimensions': [
+                        {
+                            'Name': 'ClusterId', 
+                            'Value': cluster_id
+                        }
+                    ],
+                    'Value': self.get_avg_job_completion_time(cluster_id),
+                    'Unit': 'Seconds'
+                }
+            ]
+        )
+```
+
+#### 6. Latency Characteristics
+
+Latency determines the response time characteristics and real-time capabilities of the compute engine.
+
+##### Real-Time Processing (< 100ms)
+```
+Characteristics:
+├── Immediate Response: Process events as they arrive
+├── Low Buffering: Minimal data buffering
+├── Event-by-Event: Process individual events
+├── Memory-Resident: Keep all processing state in memory
+└── Specialized Hardware: Often requires specialized infrastructure
+
+Processing Flow:
+┌─────────────────────────────────────────────────────────┐
+│  Event Arrival → Immediate Processing → Instant Output  │
+│       ↓                   ↓                    ↓        │
+│   No Buffering    →   In-Memory State   →   Direct Send │
+└─────────────────────────────────────────────────────────┘
+
+Examples: Apache Storm, specialized CEP engines, Redis Streams
+Best For: Fraud detection, algorithmic trading, real-time monitoring
+```
+
+##### Near Real-Time Processing (100ms - 10s)
+```
+Characteristics:
+├── Micro-Batching: Process small batches frequently
+├── Acceptable Delay: Slight delay acceptable for better throughput
+├── Windowing: Use time windows for aggregation
+├── Balanced Approach: Balance latency and throughput
+└── Practical Real-Time: Good enough for most real-time use cases
+
+Processing Flow:
+┌─────────────────────────────────────────────────────────┐
+│  Event Buffering → Micro-Batch Processing → Quick Output│
+│        ↓                    ↓                    ↓      │
+│   Small Windows    →   Batch Optimization  →   Results  │
+└─────────────────────────────────────────────────────────┘
+
+Examples: Spark Streaming, Flink (with larger windows), Kafka Streams
+Best For: Real-time analytics, monitoring dashboards, alerting
+```
+
+##### Batch Processing (Minutes - Hours)
+```
+Characteristics:
+├── High Throughput: Optimize for maximum data processing rate
+├── Large Batches: Process large amounts of data together
+├── Complex Processing: Support complex multi-stage processing
+├── Resource Efficiency: Maximize resource utilization
+└── Scheduled Processing: Run at specific times or intervals
+
+Processing Flow:
+┌─────────────────────────────────────────────────────────┐
+│  Data Collection → Batch Processing → Bulk Output       │
+│        ↓                  ↓                ↓            │
+│   Large Datasets  →  Complex Analytics → Reports/ETL    │
+└─────────────────────────────────────────────────────────┘
+
+Examples: MapReduce, Spark (batch mode), traditional ETL tools
+Best For: Data warehousing, ETL, machine learning training, reporting
+```
+
+This comprehensive expansion of the Key Design Dimensions provides detailed explanations, implementation examples, and practical guidance for understanding how different compute engines are designed and optimized for specific use cases.
